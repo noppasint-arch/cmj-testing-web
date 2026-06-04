@@ -176,135 +176,176 @@ export default function TestPage() {
     if (type === 'landing') { setLandingFrame(currentFrame); flash('landing'); }
   };
 
-  // ── Auto-detect markers ───────────────────────────────────────────────────
+  // ── Auto-detect markers (Ground-Strip Background Model) ──────────────────
+  //
+  // Method: compare each frame's ground-strip against a background reference
+  // built from the first frames (athlete standing still).
+  // foot_present = strip differs significantly from empty-floor background.
+  // Takeoff = TRUE→FALSE transition, Landing = FALSE→TRUE transition.
+  // Hard physical constraints: flight time 200–950 ms (jump height 5–115 cm).
+  //
   const autoDetect = async () => {
     const video = videoRef.current;
     if (!video || !isFinite(video.duration)) return;
 
     setAutoDetecting(true);
     setAutoProgress(0);
-    setAutoLog('Scanning video...');
+    setAutoLog('Building floor reference...');
 
-    // Seek helper
     const seekTo = (t: number) =>
       new Promise<void>(res => {
-        const handler = () => { video.removeEventListener('seeked', handler); res(); };
-        video.addEventListener('seeked', handler);
+        const h = () => { video.removeEventListener('seeked', h); res(); };
+        video.addEventListener('seeked', h);
         video.currentTime = t;
       });
 
-    // Downscale canvas for speed
-    const CW = 96, CH = 54;
+    // ── Canvas setup ──────────────────────────────────────────────────────
+    const CW = 160, CH = 90;
     const canvas = document.createElement('canvas');
     canvas.width = CW; canvas.height = CH;
     const ctx = canvas.getContext('2d')!;
-
     const duration = video.duration;
-    // Sample every 3 frames — fast enough on mobile
-    const step = Math.max(2, Math.round(fps / 20));
-    const samples: number[] = []; // frame numbers sampled
-    const motionFull: number[] = []; // full-frame motion
-    const motionLow: number[] = [];  // bottom-40% motion (feet zone)
 
-    let prevGray: Uint8ClampedArray | null = null;
-    let prevGrayLow: Uint8ClampedArray | null = null;
-    const totalSamples = Math.floor((duration * fps) / step);
+    // Ground-strip ROI: bottom 18% of frame, center 60% horizontally
+    // (where feet meet floor, avoiding side distractions)
+    const SY = Math.floor(CH * 0.82);
+    const SH = CH - SY;                    // ~16px strip
+    const SX = Math.floor(CW * 0.20);
+    const SW = Math.floor(CW * 0.60);      // center 60% width
+    const N_PIX = SW * SH;
 
-    const ROI_Y = Math.floor(CH * 0.6); // bottom 40% = feet zone
-    const ROI_H = CH - ROI_Y;
+    const toGray = (data: Uint8ClampedArray, n: number): Float32Array => {
+      const g = new Float32Array(n);
+      for (let p = 0; p < n; p++)
+        g[p] = data[p * 4] * 0.299 + data[p * 4 + 1] * 0.587 + data[p * 4 + 2] * 0.114;
+      return g;
+    };
+
+    // ── STEP 1: Build background from first 10% of video ─────────────────
+    // Assumes athlete enters frame and stands still at start
+    const BG_N = 8;
+    const bgSum = new Float32Array(N_PIX);
+    for (let i = 0; i < BG_N; i++) {
+      const t = (i / (BG_N - 1)) * Math.min(duration * 0.12, 1.5);
+      await seekTo(t);
+      ctx.drawImage(video, 0, 0, CW, CH);
+      const g = toGray(ctx.getImageData(SX, SY, SW, SH).data, N_PIX);
+      for (let p = 0; p < N_PIX; p++) bgSum[p] += g[p];
+      setAutoProgress(Math.round((i / BG_N) * 15));
+    }
+    const bgRef = bgSum.map(v => v / BG_N);
+
+    // ── STEP 2: Sample every 2 frames, score foot presence ───────────────
+    // foot_score = mean |current_strip - background|
+    // High score → feet on ground. Low score → floor visible = airborne.
+    const step = Math.max(1, Math.round(fps / 60)); // ~every frame up to 60fps
+    const totalSamples = Math.floor(duration * fps / step);
+    const frameNums: number[] = [];
+    const footScore: number[] = [];
+
+    setAutoLog('Scanning for foot contact...');
 
     for (let i = 0; i <= totalSamples; i++) {
-      const frameNum = i * step;
-      const t = Math.min(frameNum / fps, duration - 0.01);
-      await seekTo(t);
-
+      const fn = i * step;
+      await seekTo(Math.min(fn / fps, duration - 0.01));
       ctx.drawImage(video, 0, 0, CW, CH);
-      const full = ctx.getImageData(0, 0, CW, CH).data;
-      const low = ctx.getImageData(0, ROI_Y, CW, ROI_H).data;
-
-      // Convert to grayscale + compute diff
-      const gray = new Uint8ClampedArray(CW * CH);
-      const grayLow = new Uint8ClampedArray(CW * ROI_H);
-      for (let p = 0; p < CW * CH; p++) {
-        gray[p] = (full[p * 4] * 0.299 + full[p * 4 + 1] * 0.587 + full[p * 4 + 2] * 0.114);
-      }
-      for (let p = 0; p < CW * ROI_H; p++) {
-        grayLow[p] = (low[p * 4] * 0.299 + low[p * 4 + 1] * 0.587 + low[p * 4 + 2] * 0.114);
-      }
-
-      if (prevGray) {
-        let dFull = 0, dLow = 0;
-        for (let p = 0; p < gray.length; p++) dFull += Math.abs(gray[p] - prevGray[p]);
-        for (let p = 0; p < grayLow.length; p++) dLow += Math.abs(grayLow[p] - prevGrayLow![p]);
-        motionFull.push(dFull / gray.length);
-        motionLow.push(dLow / grayLow.length);
-        samples.push(frameNum);
-      }
-
-      prevGray = gray;
-      prevGrayLow = grayLow;
-      setAutoProgress(Math.round((i / totalSamples) * 85));
+      const g = toGray(ctx.getImageData(SX, SY, SW, SH).data, N_PIX);
+      let diff = 0;
+      for (let p = 0; p < N_PIX; p++) diff += Math.abs(g[p] - bgRef[p]);
+      footScore.push(diff / N_PIX);
+      frameNums.push(fn);
+      setAutoProgress(15 + Math.round((i / totalSamples) * 72));
     }
 
-    setAutoLog('Analyzing motion...');
+    setAutoLog('Finding jump window...');
 
-    // ── Find flight window: longest stretch of LOW motion in foot zone ──────
-    const avgLow = motionLow.reduce((a, b) => a + b, 0) / motionLow.length;
-    const threshold = avgLow * 0.35; // 35% of avg = near-static = in the air
+    // ── STEP 3: Adaptive threshold ────────────────────────────────────────
+    // Median of scores ≈ "foot present" baseline; use percentile split
+    const sorted = [...footScore].sort((a, b) => a - b);
+    const p25 = sorted[Math.floor(sorted.length * 0.25)];
+    const p75 = sorted[Math.floor(sorted.length * 0.75)];
+    const threshold = p25 + (p75 - p25) * 0.35; // 35% above lower quartile
+    // foot_present = score > threshold
+    const rawPresent = footScore.map(s => s > threshold);
 
-    // Smooth motionLow with 3-sample window
-    const smooth = motionLow.map((v, i) => {
-      const s = [motionLow[i - 1] ?? v, v, motionLow[i + 1] ?? v];
-      return s.reduce((a, b) => a + b, 0) / s.length;
-    });
+    // ── STEP 4: Temporal smoothing (require 3 consecutive frames) ─────────
+    const PERSIST = 3;
+    const present = [...rawPresent];
+    for (let i = PERSIST; i < present.length - PERSIST; i++) {
+      const w = rawPresent.slice(i - PERSIST, i + PERSIST + 1);
+      present[i] = w.filter(Boolean).length >= PERSIST;
+    }
 
-    let bestStart = -1, bestEnd = -1, bestLen = 0;
-    let winStart = -1;
-    for (let i = 0; i < smooth.length; i++) {
-      if (smooth[i] < threshold) {
-        if (winStart < 0) winStart = i;
-      } else {
-        if (winStart >= 0) {
-          const len = i - winStart;
-          if (len > bestLen) { bestLen = len; bestStart = winStart; bestEnd = i - 1; }
-          winStart = -1;
+    // ── STEP 5: Find flight windows with physical constraints ─────────────
+    // Max human CMJ: ~115 cm → flight 964 ms
+    // Min detectable hop: ~5 cm → flight 202 ms
+    const MIN_FLIGHT_S = 0.20;
+    const MAX_FLIGHT_S = 0.97;
+    const minSamples = Math.ceil(MIN_FLIGHT_S * fps / step);
+    const maxSamples = Math.floor(MAX_FLIGHT_S * fps / step);
+
+    const candidates: { tof: number; lnd: number; flightMs: number; score: number }[] = [];
+
+    for (let i = 1; i < present.length - minSamples; i++) {
+      // TRUE → FALSE = takeoff
+      if (present[i - 1] && !present[i]) {
+        for (let j = i + minSamples; j <= Math.min(i + maxSamples, present.length - 1); j++) {
+          // FALSE → TRUE = landing
+          if (!present[j - 1] && present[j]) {
+            const flightMs = (frameNums[j] - frameNums[i]) / fps * 1000;
+            // Score: prefer jumps in 300–700ms range (most common CMJ)
+            // and preceded by foot-present period (athlete standing before jump)
+            const prevStanding = present.slice(Math.max(0, i - Math.round(fps * 0.3 / step)), i)
+              .filter(Boolean).length;
+            const score = prevStanding - Math.abs(flightMs - 450) / 100;
+            candidates.push({ tof: frameNums[i], lnd: frameNums[j], flightMs, score });
+            break; // only take first landing after this takeoff
+          }
         }
       }
     }
-    // Close open window at end
-    if (winStart >= 0 && smooth.length - winStart > bestLen) {
-      bestLen = smooth.length - winStart;
-      bestStart = winStart;
-      bestEnd = smooth.length - 1;
-    }
 
-    setAutoProgress(90);
+    setAutoProgress(92);
 
-    const MIN_FLIGHT_SAMPLES = Math.max(2, Math.round(fps * 0.15 / step)); // min ~0.15s
+    if (candidates.length > 0) {
+      // Best candidate = highest score
+      const best = candidates.sort((a, b) => b.score - a.score)[0];
 
-    if (bestLen >= MIN_FLIGHT_SAMPLES && bestStart >= 0) {
-      const tof = samples[bestStart];       // first low-motion frame = just after takeoff
-      const lnd = samples[bestEnd] + step;  // first high-motion after = landing
+      setTakeoffFrame(best.tof);
+      setLandingFrame(best.lnd);
 
-      // Movement start: last high-motion sample BEFORE the low window
+      // Movement start: scan backward from takeoff for first motion onset
+      // (full-frame inter-frame diff to catch body descending)
       let mvt: number | null = null;
-      for (let i = bestStart - 1; i >= 0; i--) {
-        if (smooth[i] > avgLow * 0.6) { mvt = samples[i]; break; }
+      const STILL_THRESHOLD = footScore[0] * 1.3; // slightly above background noise
+      for (let i = frameNums.indexOf(best.tof) - 1; i >= 0; i--) {
+        if (footScore[i] < STILL_THRESHOLD) {
+          // Found a low-activity frame → movement started just after this
+          mvt = frameNums[Math.min(i + 2, frameNums.length - 1)];
+          break;
+        }
       }
+      if (mvt === null) {
+        // Fallback: 400ms before takeoff
+        mvt = Math.max(0, best.tof - Math.round(fps * 0.4));
+      }
+      setMovementStartFrame(mvt);
+      seekToFrame(best.tof);
 
-      setTakeoffFrame(Math.max(0, tof - step)); // 1 sample earlier = true takeoff
-      setLandingFrame(Math.min(totalFrames - 1, lnd));
-      if (mvt !== null) setMovementStartFrame(Math.max(0, mvt - step));
-      seekToFrame(Math.max(0, tof - step));
-
-      setAutoLog(`✅ Done — flight ~${((bestLen * step / fps) * 1000).toFixed(0)} ms detected`);
+      const jh = ((9.81 * (best.flightMs / 1000) ** 2) / 8 * 100).toFixed(1);
+      setAutoLog(`✅ Jump detected — flight ${Math.round(best.flightMs)} ms (~${jh} cm)`);
     } else {
-      setAutoLog('⚠ Could not detect jump. Set markers manually.');
+      // Diagnostic: report what was found
+      const anyLow = present.filter(v => !v).length;
+      if (anyLow < minSamples) {
+        setAutoLog('⚠ Feet always on ground — is this a jump video? Try manual markers.');
+      } else {
+        setAutoLog('⚠ No jump in 200–950 ms range found. Fine-tune manually with ±1/±10 buttons.');
+      }
     }
 
     setAutoProgress(100);
     setAutoDetecting(false);
-    // Restore video position
     await seekTo(0);
   };
 
