@@ -41,6 +41,9 @@ export default function TestPage() {
   const [notes, setNotes] = useState('');
   const [saving, setSaving] = useState(false);
   const [flashMarker, setFlashMarker] = useState<string | null>(null);
+  const [autoDetecting, setAutoDetecting] = useState(false);
+  const [autoProgress, setAutoProgress] = useState(0);
+  const [autoLog, setAutoLog] = useState('');
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const isDragging = useRef(false);
   const dragStartX = useRef(0);
@@ -171,6 +174,138 @@ export default function TestPage() {
     if (type === 'movement') { setMovementStartFrame(currentFrame); flash('movement'); }
     if (type === 'takeoff') { setTakeoffFrame(currentFrame); flash('takeoff'); }
     if (type === 'landing') { setLandingFrame(currentFrame); flash('landing'); }
+  };
+
+  // ── Auto-detect markers ───────────────────────────────────────────────────
+  const autoDetect = async () => {
+    const video = videoRef.current;
+    if (!video || !isFinite(video.duration)) return;
+
+    setAutoDetecting(true);
+    setAutoProgress(0);
+    setAutoLog('Scanning video...');
+
+    // Seek helper
+    const seekTo = (t: number) =>
+      new Promise<void>(res => {
+        const handler = () => { video.removeEventListener('seeked', handler); res(); };
+        video.addEventListener('seeked', handler);
+        video.currentTime = t;
+      });
+
+    // Downscale canvas for speed
+    const CW = 96, CH = 54;
+    const canvas = document.createElement('canvas');
+    canvas.width = CW; canvas.height = CH;
+    const ctx = canvas.getContext('2d')!;
+
+    const duration = video.duration;
+    // Sample every 3 frames — fast enough on mobile
+    const step = Math.max(2, Math.round(fps / 20));
+    const samples: number[] = []; // frame numbers sampled
+    const motionFull: number[] = []; // full-frame motion
+    const motionLow: number[] = [];  // bottom-40% motion (feet zone)
+
+    let prevGray: Uint8ClampedArray | null = null;
+    let prevGrayLow: Uint8ClampedArray | null = null;
+    const totalSamples = Math.floor((duration * fps) / step);
+
+    const ROI_Y = Math.floor(CH * 0.6); // bottom 40% = feet zone
+    const ROI_H = CH - ROI_Y;
+
+    for (let i = 0; i <= totalSamples; i++) {
+      const frameNum = i * step;
+      const t = Math.min(frameNum / fps, duration - 0.01);
+      await seekTo(t);
+
+      ctx.drawImage(video, 0, 0, CW, CH);
+      const full = ctx.getImageData(0, 0, CW, CH).data;
+      const low = ctx.getImageData(0, ROI_Y, CW, ROI_H).data;
+
+      // Convert to grayscale + compute diff
+      const gray = new Uint8ClampedArray(CW * CH);
+      const grayLow = new Uint8ClampedArray(CW * ROI_H);
+      for (let p = 0; p < CW * CH; p++) {
+        gray[p] = (full[p * 4] * 0.299 + full[p * 4 + 1] * 0.587 + full[p * 4 + 2] * 0.114);
+      }
+      for (let p = 0; p < CW * ROI_H; p++) {
+        grayLow[p] = (low[p * 4] * 0.299 + low[p * 4 + 1] * 0.587 + low[p * 4 + 2] * 0.114);
+      }
+
+      if (prevGray) {
+        let dFull = 0, dLow = 0;
+        for (let p = 0; p < gray.length; p++) dFull += Math.abs(gray[p] - prevGray[p]);
+        for (let p = 0; p < grayLow.length; p++) dLow += Math.abs(grayLow[p] - prevGrayLow![p]);
+        motionFull.push(dFull / gray.length);
+        motionLow.push(dLow / grayLow.length);
+        samples.push(frameNum);
+      }
+
+      prevGray = gray;
+      prevGrayLow = grayLow;
+      setAutoProgress(Math.round((i / totalSamples) * 85));
+    }
+
+    setAutoLog('Analyzing motion...');
+
+    // ── Find flight window: longest stretch of LOW motion in foot zone ──────
+    const avgLow = motionLow.reduce((a, b) => a + b, 0) / motionLow.length;
+    const threshold = avgLow * 0.35; // 35% of avg = near-static = in the air
+
+    // Smooth motionLow with 3-sample window
+    const smooth = motionLow.map((v, i) => {
+      const s = [motionLow[i - 1] ?? v, v, motionLow[i + 1] ?? v];
+      return s.reduce((a, b) => a + b, 0) / s.length;
+    });
+
+    let bestStart = -1, bestEnd = -1, bestLen = 0;
+    let winStart = -1;
+    for (let i = 0; i < smooth.length; i++) {
+      if (smooth[i] < threshold) {
+        if (winStart < 0) winStart = i;
+      } else {
+        if (winStart >= 0) {
+          const len = i - winStart;
+          if (len > bestLen) { bestLen = len; bestStart = winStart; bestEnd = i - 1; }
+          winStart = -1;
+        }
+      }
+    }
+    // Close open window at end
+    if (winStart >= 0 && smooth.length - winStart > bestLen) {
+      bestLen = smooth.length - winStart;
+      bestStart = winStart;
+      bestEnd = smooth.length - 1;
+    }
+
+    setAutoProgress(90);
+
+    const MIN_FLIGHT_SAMPLES = Math.max(2, Math.round(fps * 0.15 / step)); // min ~0.15s
+
+    if (bestLen >= MIN_FLIGHT_SAMPLES && bestStart >= 0) {
+      const tof = samples[bestStart];       // first low-motion frame = just after takeoff
+      const lnd = samples[bestEnd] + step;  // first high-motion after = landing
+
+      // Movement start: last high-motion sample BEFORE the low window
+      let mvt: number | null = null;
+      for (let i = bestStart - 1; i >= 0; i--) {
+        if (smooth[i] > avgLow * 0.6) { mvt = samples[i]; break; }
+      }
+
+      setTakeoffFrame(Math.max(0, tof - step)); // 1 sample earlier = true takeoff
+      setLandingFrame(Math.min(totalFrames - 1, lnd));
+      if (mvt !== null) setMovementStartFrame(Math.max(0, mvt - step));
+      seekToFrame(Math.max(0, tof - step));
+
+      setAutoLog(`✅ Done — flight ~${((bestLen * step / fps) * 1000).toFixed(0)} ms detected`);
+    } else {
+      setAutoLog('⚠ Could not detect jump. Set markers manually.');
+    }
+
+    setAutoProgress(100);
+    setAutoDetecting(false);
+    // Restore video position
+    await seekTo(0);
   };
 
   // ── Save ──────────────────────────────────────────────────────────────────
@@ -393,6 +528,57 @@ export default function TestPage() {
 
       {/* Marker buttons */}
       <div style={{ padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+
+        {/* ── Auto-Detect button ── */}
+        <button
+          onClick={autoDetect}
+          disabled={autoDetecting || totalFrames === 0}
+          style={{
+            width: '100%', border: 'none', borderRadius: 14, padding: '13px',
+            background: autoDetecting ? '#1A1A26' : 'linear-gradient(135deg,#6C63FF,#00D4FF)',
+            color: autoDetecting ? '#5A5A7A' : '#fff',
+            fontWeight: 700, fontSize: 15, cursor: autoDetecting ? 'default' : 'pointer',
+            position: 'relative', overflow: 'hidden',
+          }}
+        >
+          {autoDetecting ? (
+            <span>🔍 Analyzing… {autoProgress}%</span>
+          ) : (
+            <span>✨ Auto-Detect Markers</span>
+          )}
+        </button>
+
+        {/* Progress bar */}
+        {autoDetecting && (
+          <div style={{ height: 4, background: '#1A1A26', borderRadius: 2, overflow: 'hidden' }}>
+            <div style={{
+              height: '100%', background: 'linear-gradient(90deg,#6C63FF,#00D4FF)',
+              borderRadius: 2, transition: 'width 0.3s',
+              width: `${autoProgress}%`,
+            }} />
+          </div>
+        )}
+
+        {/* Auto-detect log */}
+        {autoLog && !autoDetecting && (
+          <div style={{
+            background: autoLog.startsWith('✅') ? 'rgba(76,175,80,0.1)' : 'rgba(255,152,0,0.1)',
+            border: `1px solid ${autoLog.startsWith('✅') ? '#4CAF50' : '#FF9800'}`,
+            borderRadius: 10, padding: '8px 12px',
+            color: autoLog.startsWith('✅') ? '#4CAF50' : '#FF9800',
+            fontSize: 13,
+          }}>
+            {autoLog}
+          </div>
+        )}
+
+        {/* Divider */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ flex: 1, height: 1, background: '#2A2A3E' }} />
+          <span style={{ color: '#5A5A7A', fontSize: 11 }}>or set manually</span>
+          <div style={{ flex: 1, height: 1, background: '#2A2A3E' }} />
+        </div>
+
         <div style={{ display: 'flex', gap: 8 }}>
           <MarkerBtn
             label="Movement Start"
