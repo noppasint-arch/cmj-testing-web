@@ -70,20 +70,38 @@ export default function TestPage() {
     return () => { streamRef.current?.getTracks().forEach(t => t.stop()); };
   }, [step]);
 
+  const getSupportedMimeType = (): string => {
+    const types = [
+      'video/mp4;codecs=h264',
+      'video/mp4',
+      'video/webm;codecs=vp9',
+      'video/webm;codecs=vp8',
+      'video/webm',
+    ];
+    for (const t of types) {
+      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t)) return t;
+    }
+    return '';
+  };
+
   const startRecording = () => {
     if (!streamRef.current) return;
     chunksRef.current = [];
-    const mr = new MediaRecorder(streamRef.current, { mimeType: 'video/webm;codecs=vp9' });
+    const mimeType = getSupportedMimeType();
+    const mr = mimeType
+      ? new MediaRecorder(streamRef.current, { mimeType })
+      : new MediaRecorder(streamRef.current);
+    const actualMime = mr.mimeType || 'video/mp4';
     mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
     mr.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: 'video/webm' });
+      const blob = new Blob(chunksRef.current, { type: actualMime });
       const url = URL.createObjectURL(blob);
       setVideoBlob(blob);
       setVideoUrl(url);
       streamRef.current?.getTracks().forEach(t => t.stop());
       setStep('analyze');
     };
-    mr.start();
+    mr.start(100); // collect data every 100ms for better compat
     mediaRecRef.current = mr;
     setRecording(true);
   };
@@ -93,11 +111,34 @@ export default function TestPage() {
     setRecording(false);
   };
 
-  // ── Video loaded ──────────────────────────────────────────────────────────
+  // ── Video loaded — Safari fix: duration is NaN until seeked ─────────────
+  const resolveDuration = () => {
+    if (!videoRef.current) return;
+    const dur = videoRef.current.duration;
+    if (isNaN(dur) || !isFinite(dur)) return; // will be called again from onSeeked
+    const frames = Math.floor(dur * fps);
+    setTotalFrames(frames);
+    setCurrentFrame(0);
+    videoRef.current.currentTime = 0;
+  };
+
   const onVideoLoaded = () => {
     if (!videoRef.current) return;
     const dur = videoRef.current.duration;
-    setTotalFrames(Math.floor(dur * fps));
+    if (isNaN(dur) || !isFinite(dur)) {
+      // Safari: seek far ahead to force the browser to read the duration
+      videoRef.current.currentTime = 1e10;
+    } else {
+      resolveDuration();
+    }
+  };
+
+  const onSeeked = () => {
+    if (!videoRef.current) return;
+    const dur = videoRef.current.duration;
+    if (!isNaN(dur) && isFinite(dur) && totalFrames === 0) {
+      resolveDuration();
+    }
   };
 
   const seekToFrame = (f: number) => {
@@ -263,7 +304,14 @@ export default function TestPage() {
             <div style={{ position: 'absolute', right: 0, top: '110%', background: '#1A1A26',
               border: '1px solid #2A2A3E', borderRadius: 10, zIndex: 50, overflow: 'hidden' }}>
               {FPS_OPTIONS.map(f => (
-                <button key={f} onClick={() => { setFps(f); setShowFpsMenu(false); onVideoLoaded(); }}
+                <button key={f} onClick={() => {
+                  setFps(f);
+                  setShowFpsMenu(false);
+                  if (videoRef.current && isFinite(videoRef.current.duration)) {
+                    setTotalFrames(Math.floor(videoRef.current.duration * f));
+                    setCurrentFrame(0);
+                  }
+                }}
                   style={{ display: 'block', width: '100%', padding: '10px 20px',
                     background: f === fps ? '#6C63FF' : 'none', border: 'none',
                     color: '#F0F0FF', cursor: 'pointer', fontSize: 13, textAlign: 'left' }}>
@@ -283,7 +331,8 @@ export default function TestPage() {
       }}>
         <video ref={videoRef} src={videoUrl} playsInline
           onLoadedMetadata={onVideoLoaded}
-          style={{ width: '100%', display: 'block', maxHeight: 240, objectFit: 'contain', background: '#000' }}
+          onSeeked={onSeeked}
+          style={{ width: '100%', display: 'block', maxHeight: 260, objectFit: 'contain', background: '#000' }}
         />
         {/* Frame overlay */}
         <div style={{
