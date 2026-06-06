@@ -59,11 +59,12 @@ input[type=range]::-webkit-slider-thumb {
   0%, 100% { transform: rotate(28deg); }
   50%       { transform: rotate(-28deg); }
 }
+/* Arms swing opposite to same-side leg (cross-body running) */
 @keyframes drillArmL {
-  0%, 100% { transform: rotate(22deg); }
-  50%       { transform: rotate(-22deg); }
+  0%, 100% { transform: rotate(-28deg); }
+  50%       { transform: rotate(28deg); }
 }
 @keyframes drillArmR {
-  0%, 100% { transform: rotate(-22deg); }
-  50%       { transform: rotate(22deg); }
+  0%, 100% { transform: rotate(28deg); }
+  50%       { transform: rotate(-28deg); }
 }
