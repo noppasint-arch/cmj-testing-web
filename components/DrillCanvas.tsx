@@ -2,12 +2,54 @@
 import { useRef, useCallback, useEffect } from 'react';
 import { useDrillStore, BALL_ID_CONST, EntityPos } from '@/store/drillStore';
 
+// ─── SVG viewport ────────────────────────────────────────────────────────────
 const VW = 400;
-const VH = 210;
+const VH = 220;
 
-// Court boundaries (inner playing surface)
-const CX1 = 14, CX2 = 386, CY1 = 10, CY2 = 200;
-const CW = CX2 - CX1, CH = CY2 - CY1;
+// ─── Perspective trapezoid ───────────────────────────────────────────────────
+// Court coords: (0–400 x, 0–200 y)  y=0 = far end, y=200 = near (viewer side)
+const NY = 198, FY = 20;          // near/far screen Y
+const NLX = 6,  NRX = 394;       // near left/right X (wide)
+const FLX = 72, FRX = 328;       // far  left/right X (narrow)
+
+function cToS(cx: number, cy: number) {
+  const t = 1 - Math.max(0, Math.min(1, cy / 200)); // 0=near, 1=far
+  const lx = NLX + (FLX - NLX) * t;
+  const rx = NRX + (FRX - NRX) * t;
+  return {
+    x: lx + (rx - lx) * Math.max(0, Math.min(1, cx / 400)),
+    y: NY  + (FY  - NY)  * t,
+  };
+}
+
+function sToC(sx: number, sy: number): EntityPos {
+  const t  = Math.max(0, Math.min(1, (sy - NY) / (FY - NY)));
+  const lx = NLX + (FLX - NLX) * t;
+  const rx = NRX + (FRX - NRX) * t;
+  const denom = Math.max(1, rx - lx);
+  return {
+    x: Math.max(0, Math.min(400, ((sx - lx) / denom) * 400)),
+    y: Math.max(0, Math.min(200, (1 - t) * 200)),
+  };
+}
+
+// Project a circle → perspective polygon path
+function projCircle(cx: number, cy: number, r: number, n = 44) {
+  return Array.from({ length: n }, (_, i) => {
+    const θ = (i / n) * Math.PI * 2;
+    const p = cToS(cx + r * Math.cos(θ), cy + r * Math.sin(θ));
+    return `${i === 0 ? 'M' : 'L'}${p.x},${p.y}`;
+  }).join(' ') + ' Z';
+}
+
+// Project arc
+function projArc(cx: number, cy: number, r: number, a0: number, a1: number, n = 32) {
+  return Array.from({ length: n + 1 }, (_, i) => {
+    const θ = a0 + (a1 - a0) * (i / n);
+    const p = cToS(cx + r * Math.cos(θ), cy + r * Math.sin(θ));
+    return `${i === 0 ? 'M' : 'L'}${p.x},${p.y}`;
+  }).join(' ');
+}
 
 function lerpPos(a: EntityPos, b: EntityPos, t: number): EntityPos {
   return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
@@ -15,342 +57,335 @@ function lerpPos(a: EntityPos, b: EntityPos, t: number): EntityPos {
 function easeInOut(t: number) {
   return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
 }
-function facingAngle(from: EntityPos, to: EntityPos): number | null {
-  const dx = to.x - from.x;
-  const dy = to.y - from.y;
-  if (Math.sqrt(dx * dx + dy * dy) < 4) return null;
-  return Math.atan2(dy, dx) * (180 / Math.PI) + 90;
-}
 
 // ─── Palette ──────────────────────────────────────────────────────────────────
-
-const PALETTE = {
-  home:    { base: '#1d6fe8', hi: '#6db3ff', lo: '#0d3580', short: '#0d2560' },
-  away:    { base: '#e03030', hi: '#ff8080', lo: '#7a1010', short: '#5a0808' },
-  home_gk: { base: '#17a589', hi: '#5efcd9', lo: '#0c5c4e', short: '#0c4c40' },
-  away_gk: { base: '#8b30e8', hi: '#cc88ff', lo: '#4a0c90', short: '#380870' },
+const PAL = {
+  home:    { j: '#1d6fe8', jhi: '#6db3ff', jlo: '#0d3070', sh: '#0d2560', stripe: '#ffffff' },
+  away:    { j: '#e03030', jhi: '#ff8888', jlo: '#6a0c0c', sh: '#5a0808', stripe: '#ffffff' },
+  home_gk: { j: '#17a589', jhi: '#5efcd9', jlo: '#0c5040', sh: '#0c4c40', stripe: '#ffd700' },
+  away_gk: { j: '#8b30e8', jhi: '#cc88ff', jlo: '#420888', sh: '#380870', stripe: '#ffffff' },
 };
-const SKIN = { base: '#f5c478', hi: '#fff0d0', lo: '#b06020' };
-const BOOT = { base: '#1a1a1a', hi: '#666', lo: '#000' };
+const SKIN = '#f5c478';
+const SKIN_HI = '#fff0d0';
+const SKIN_SH = '#c07828';
 
 // ─── SVG Defs ─────────────────────────────────────────────────────────────────
-
 function SVGDefs() {
   return (
     <defs>
-      {/* ── Wood parquet floor pattern ── */}
-      <pattern id="woodPlanks" x="0" y="0" width="32" height="10" patternUnits="userSpaceOnUse">
-        {/* Plank row A */}
-        <rect x="0" y="0" width="32" height="5" fill="#c8904a" />
-        {/* Plank row B — offset */}
-        <rect x="0" y="5" width="32" height="5" fill="#be8640" />
-        {/* Grain lines in A */}
-        <line x1="8"  y1="0" x2="8"  y2="5" stroke="rgba(0,0,0,0.10)" strokeWidth="0.6" />
-        <line x1="16" y1="0" x2="16" y2="5" stroke="rgba(0,0,0,0.10)" strokeWidth="0.6" />
-        <line x1="24" y1="0" x2="24" y2="5" stroke="rgba(0,0,0,0.10)" strokeWidth="0.6" />
-        {/* Grain lines in B */}
-        <line x1="4"  y1="5" x2="4"  y2="10" stroke="rgba(0,0,0,0.10)" strokeWidth="0.6" />
-        <line x1="12" y1="5" x2="12" y2="10" stroke="rgba(0,0,0,0.10)" strokeWidth="0.6" />
-        <line x1="20" y1="5" x2="20" y2="10" stroke="rgba(0,0,0,0.10)" strokeWidth="0.6" />
-        <line x1="28" y1="5" x2="28" y2="10" stroke="rgba(0,0,0,0.10)" strokeWidth="0.6" />
-        {/* Row separator */}
-        <line x1="0" y1="5" x2="32" y2="5" stroke="rgba(0,0,0,0.20)" strokeWidth="0.5" />
+      {/* Wood parquet */}
+      <pattern id="wood" x="0" y="0" width="30" height="9" patternUnits="userSpaceOnUse">
+        <rect x="0" y="0" width="30" height="4.5" fill="#cc924a" />
+        <rect x="0" y="4.5" width="30" height="4.5" fill="#c08840" />
+        <line x1="7.5"  y1="0" x2="7.5"  y2="4.5" stroke="rgba(0,0,0,0.09)" strokeWidth="0.5" />
+        <line x1="15"   y1="0" x2="15"   y2="4.5" stroke="rgba(0,0,0,0.09)" strokeWidth="0.5" />
+        <line x1="22.5" y1="0" x2="22.5" y2="4.5" stroke="rgba(0,0,0,0.09)" strokeWidth="0.5" />
+        <line x1="5"    y1="4.5" x2="5"  y2="9" stroke="rgba(0,0,0,0.09)" strokeWidth="0.5" />
+        <line x1="15"   y1="4.5" x2="15" y2="9" stroke="rgba(0,0,0,0.09)" strokeWidth="0.5" />
+        <line x1="25"   y1="4.5" x2="25" y2="9" stroke="rgba(0,0,0,0.09)" strokeWidth="0.5" />
+        <line x1="0" y1="4.5" x2="30" y2="4.5" stroke="rgba(0,0,0,0.16)" strokeWidth="0.5" />
       </pattern>
 
-      {/* ── Depth gradient (far end darker) ── */}
-      <linearGradient id="depthFog" x1="0%" y1="0%" x2="0%" y2="100%">
-        <stop offset="0%"   stopColor="#000" stopOpacity="0.42" />
-        <stop offset="35%"  stopColor="#000" stopOpacity="0.10" />
-        <stop offset="65%"  stopColor="#000" stopOpacity="0.00" />
-        <stop offset="100%" stopColor="#fff" stopOpacity="0.04" />
+      {/* Court depth gradient */}
+      <linearGradient id="depthGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+        <stop offset="0%"   stopColor="#000" stopOpacity="0.46" />
+        <stop offset="40%"  stopColor="#000" stopOpacity="0.10" />
+        <stop offset="70%"  stopColor="#000" stopOpacity="0.00" />
+        <stop offset="100%" stopColor="#fff" stopOpacity="0.05" />
       </linearGradient>
 
-      {/* ── Centre-court overhead light reflection ── */}
-      <radialGradient id="lightGlow" cx="50%" cy="50%" r="50%">
-        <stop offset="0%"   stopColor="#fff" stopOpacity="0.09" />
+      {/* Centre light reflection */}
+      <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+        <stop offset="0%"   stopColor="#fff" stopOpacity="0.10" />
         <stop offset="100%" stopColor="#fff" stopOpacity="0.00" />
       </radialGradient>
 
-      {/* ── Arena wall gradient ── */}
-      <linearGradient id="arenaWall" x1="0%" y1="0%" x2="0%" y2="100%">
-        <stop offset="0%"   stopColor="#0e0e22" />
-        <stop offset="100%" stopColor="#1a1a38" />
+      {/* Arena dark bg */}
+      <linearGradient id="arenaBg" x1="0%" y1="0%" x2="0%" y2="100%">
+        <stop offset="0%"   stopColor="#080818" />
+        <stop offset="100%" stopColor="#141430" />
       </linearGradient>
 
-      {/* ── Stands gradient (purple like Nonthaburi) ── */}
-      <linearGradient id="standsTop" x1="0%" y1="100%" x2="0%" y2="0%">
-        <stop offset="0%"   stopColor="#2a1a5e" />
-        <stop offset="100%" stopColor="#1a0e3a" />
-      </linearGradient>
-      <linearGradient id="standsBot" x1="0%" y1="0%" x2="0%" y2="100%">
-        <stop offset="0%"   stopColor="#2a1a5e" />
-        <stop offset="100%" stopColor="#1a0e3a" />
+      {/* Sphere gradients for head/ball */}
+      {(Object.keys(PAL) as Array<keyof typeof PAL>).map(k => (
+        <radialGradient key={k} id={`sph-${k}`} cx="33%" cy="28%" r="70%">
+          <stop offset="0%"   stopColor={PAL[k].jhi} />
+          <stop offset="55%"  stopColor={PAL[k].j} />
+          <stop offset="100%" stopColor={PAL[k].jlo} />
+        </radialGradient>
+      ))}
+      <radialGradient id="sph-skin" cx="33%" cy="28%" r="70%">
+        <stop offset="0%"   stopColor={SKIN_HI} />
+        <stop offset="55%"  stopColor={SKIN} />
+        <stop offset="100%" stopColor={SKIN_SH} />
+      </radialGradient>
+      <radialGradient id="sph-ball" cx="33%" cy="28%" r="70%">
+        <stop offset="0%"   stopColor="#ffffff" />
+        <stop offset="55%"  stopColor="#f0f0e8" />
+        <stop offset="100%" stopColor="#aaaaaa" />
+      </radialGradient>
+      <radialGradient id="sph-boot" cx="33%" cy="28%" r="70%">
+        <stop offset="0%"   stopColor="#555" />
+        <stop offset="55%"  stopColor="#1a1a1a" />
+        <stop offset="100%" stopColor="#000" />
+      </radialGradient>
+
+      {/* Cylinder H gradient per team */}
+      {(Object.keys(PAL) as Array<keyof typeof PAL>).map(k => (
+        <linearGradient key={k} id={`cH-${k}`} x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%"   stopColor={PAL[k].jlo} />
+          <stop offset="22%"  stopColor={PAL[k].jhi} />
+          <stop offset="60%"  stopColor={PAL[k].j} />
+          <stop offset="100%" stopColor={PAL[k].jlo} />
+        </linearGradient>
+      ))}
+      <linearGradient id="cH-skin" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%"   stopColor={SKIN_SH} />
+        <stop offset="25%"  stopColor={SKIN_HI} />
+        <stop offset="65%"  stopColor={SKIN} />
+        <stop offset="100%" stopColor={SKIN_SH} />
       </linearGradient>
 
-      {/* ── Drop-shadow filter ── */}
-      <filter id="figShadow" x="-40%" y="-40%" width="180%" height="180%">
-        <feDropShadow dx="0.5" dy="2" stdDeviation="1.5" floodColor="#000" floodOpacity="0.55" />
+      {/* Cylinder V gradient per team */}
+      {(Object.keys(PAL) as Array<keyof typeof PAL>).map(k => (
+        <linearGradient key={k} id={`cV-${k}`} x1="0%" y1="0%" x2="0%" y2="100%">
+          <stop offset="0%"   stopColor={PAL[k].jhi} />
+          <stop offset="45%"  stopColor={PAL[k].j} />
+          <stop offset="100%" stopColor={PAL[k].jlo} />
+        </linearGradient>
+      ))}
+      <linearGradient id="cV-skin" x1="0%" y1="0%" x2="0%" y2="100%">
+        <stop offset="0%"   stopColor={SKIN_HI} />
+        <stop offset="45%"  stopColor={SKIN} />
+        <stop offset="100%" stopColor={SKIN_SH} />
+      </linearGradient>
+
+      {/* Drop shadow */}
+      <filter id="fshadow" x="-40%" y="-40%" width="180%" height="180%">
+        <feDropShadow dx="0" dy="1.5" stdDeviation="1.5" floodColor="#000" floodOpacity="0.6" />
       </filter>
-      <filter id="glowYellow" x="-60%" y="-60%" width="220%" height="220%">
+      <filter id="fglow" x="-60%" y="-60%" width="220%" height="220%">
         <feDropShadow dx="0" dy="0" stdDeviation="2.5" floodColor="#FFD60A" floodOpacity="0.9" />
       </filter>
 
-      {/* ── Sphere gradients for player parts ── */}
-      {([...Object.entries(PALETTE), ['skin', SKIN], ['boot', BOOT]] as [string, typeof SKIN][]).map(([k, c]) => (
-        <radialGradient key={k} id={`sph-${k}`} cx="33%" cy="27%" r="70%">
-          <stop offset="0%"   stopColor={c.hi} />
-          <stop offset="50%"  stopColor={c.base} />
-          <stop offset="100%" stopColor={c.lo} />
-        </radialGradient>
-      ))}
-
-      {/* ── Cylinder (horizontal) ── */}
-      {([...Object.entries(PALETTE), ['skin', SKIN]] as [string, typeof SKIN][]).map(([k, c]) => (
-        <linearGradient key={k} id={`cylH-${k}`} x1="0%" y1="0%" x2="100%" y2="0%">
-          <stop offset="0%"   stopColor={c.lo} />
-          <stop offset="20%"  stopColor={c.hi} />
-          <stop offset="55%"  stopColor={c.base} />
-          <stop offset="100%" stopColor={c.lo} />
-        </linearGradient>
-      ))}
-
-      {/* ── Cylinder (vertical) ── */}
-      {([...Object.entries(PALETTE), ['skin', SKIN]] as [string, typeof SKIN][]).map(([k, c]) => (
-        <linearGradient key={k} id={`cylV-${k}`} x1="0%" y1="0%" x2="0%" y2="100%">
-          <stop offset="0%"   stopColor={c.hi} />
-          <stop offset="45%"  stopColor={c.base} />
-          <stop offset="100%" stopColor={c.lo} />
-        </linearGradient>
-      ))}
-
-      {/* Hair clip masks per team */}
-      {Object.keys(PALETTE).map(k => (
-        <clipPath key={k} id={`hairClip-${k}`}>
-          <rect x="-9" y="-30" width="18" height="14" />
+      {/* Hair clips per team */}
+      {(Object.keys(PAL) as Array<keyof typeof PAL>).map(k => (
+        <clipPath key={k} id={`hc-${k}`}>
+          <rect x="-9" y="-28" width="18" height="13" />
         </clipPath>
       ))}
     </defs>
   );
 }
 
-// ─── Futsal court (wood + arena) ──────────────────────────────────────────────
+// ─── Isometric court ──────────────────────────────────────────────────────────
+function IsoCourt() {
+  const corners = [cToS(0,0), cToS(400,0), cToS(400,200), cToS(0,200)];
+  const courtPath = corners.map((p,i)=>`${i===0?'M':'L'}${p.x},${p.y}`).join(' ')+' Z';
 
-function FutsalCourt() {
-  const mx = (CX1 + CX2) / 2;
-  const my = (CY1 + CY2) / 2;
+  const gl = cToS(0, 100);   // left goal  (cx=0, half-width)
+  const gr = cToS(400, 100); // right goal
+
+  // Goal width = 15 court units each side of centre
+  const glT = cToS(0, 85), glB = cToS(0, 115);
+  const grT = cToS(400, 85), grB = cToS(400, 115);
+
+  // Goal depth offset (into court)
+  const gDepth = 12; // court units into court
+  const glT2 = cToS(gDepth, 88), glB2 = cToS(gDepth, 112);
+  const grT2 = cToS(400-gDepth, 88), grB2 = cToS(400-gDepth, 112);
+
+  // Centre line
+  const clTop = cToS(200, 0), clBot = cToS(200, 200);
+
+  // Penalty spots
+  const lspot = cToS(55, 100);
+  const rspot = cToS(345, 100);
 
   return (
     <g>
-      {/* ── Arena outer shell ── */}
-      <rect x={0} y={0} width={VW} height={VH} fill="url(#arenaWall)" rx={6} />
+      {/* Arena background */}
+      <rect x={0} y={0} width={VW} height={VH} fill="url(#arenaBg)" rx={6} />
 
-      {/* ── Stands top (purple seats) ── */}
-      <rect x={0} y={0} width={VW} height={CY1 + 2} fill="url(#standsTop)" />
-      {/* Seat row hints */}
-      {[0, 2, 4, 6].map(i => (
-        <line key={i} x1={0} y1={i + 1} x2={VW} y2={i + 1}
-          stroke="rgba(120,80,200,0.25)" strokeWidth="1" />
+      {/* Purple stands - top */}
+      <rect x={0} y={0} width={VW} height={FY + 2} fill="#1e0a42" />
+      {[1,3,5,7,9,11,14,17].map(i => (
+        <line key={i} x1={0} y1={i} x2={VW} y2={i} stroke="rgba(130,70,220,0.22)" strokeWidth="1.2" />
       ))}
 
-      {/* ── Stands bottom ── */}
-      <rect x={0} y={CY2 - 2} width={VW} height={VH - CY2 + 6} fill="url(#standsBot)" />
-      {[0, 2, 4, 6].map(i => (
-        <line key={i} x1={0} y1={CY2 + i} x2={VW} y2={CY2 + i}
-          stroke="rgba(120,80,200,0.20)" strokeWidth="1" />
+      {/* Purple stands - bottom */}
+      <rect x={0} y={NY - 1} width={VW} height={VH - NY + 4} fill="#1e0a42" />
+      {[0,2,4,6,8,10,13,16].map(i => (
+        <line key={i} x1={0} y1={NY + i} x2={VW} y2={NY + i} stroke="rgba(130,70,220,0.18)" strokeWidth="1.2" />
       ))}
 
-      {/* ── Court border strip (dark wood edge) ── */}
-      <rect x={CX1 - 3} y={CY1 - 3} width={CW + 6} height={CH + 6}
-        fill="#7a4e1a" rx={2} />
+      {/* Court dark border strip */}
+      <polygon
+        points={corners.map(p=>`${p.x},${p.y}`).join(' ')}
+        fill="#7a4e1a" />
 
-      {/* ── Wood parquet surface ── */}
-      <rect x={CX1} y={CY1} width={CW} height={CH} fill="url(#woodPlanks)" />
+      {/* Wood surface */}
+      <path d={courtPath} fill="url(#wood)" />
 
-      {/* ── Depth fog overlay (far end darker = 3D illusion) ── */}
-      <rect x={CX1} y={CY1} width={CW} height={CH} fill="url(#depthFog)" />
+      {/* Depth gradient */}
+      <path d={courtPath} fill="url(#depthGrad)" />
 
-      {/* ── Overhead light reflection (centre glow) ── */}
-      <ellipse cx={mx} cy={my} rx={100} ry={50} fill="url(#lightGlow)" />
+      {/* Centre light reflection */}
+      {(() => {
+        const cc = cToS(200, 100);
+        return <ellipse cx={cc.x} cy={cc.y} rx={90} ry={35} fill="url(#glow)" />;
+      })()}
 
-      {/* ── Varnish sheen – diagonal highlight strip ── */}
-      <rect x={CX1} y={CY1} width={CW} height={CH}
-        fill="rgba(255,255,255,0.03)"
-        style={{ maskImage: 'linear-gradient(135deg, rgba(255,255,255,0.08) 0%, transparent 60%)' }} />
-
-      {/* ══ COURT MARKINGS ══ */}
+      {/* ═══ Court markings ═══ */}
       {/* Boundary */}
-      <rect x={CX1 + 3} y={CY1 + 3} width={CW - 6} height={CH - 6}
-        fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth={1.6} />
+      <path d={courtPath} fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth={1.6} />
 
       {/* Centre line */}
-      <line x1={mx} y1={CY1 + 3} x2={mx} y2={CY2 - 3}
+      <line x1={clTop.x} y1={clTop.y} x2={clBot.x} y2={clBot.y}
         stroke="rgba(255,255,255,0.92)" strokeWidth={1.6} />
 
-      {/* Centre circle (3m radius → 30px) */}
-      <circle cx={mx} cy={my} r={30}
-        fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth={1.6} />
-      <circle cx={mx} cy={my} r={2.5} fill="rgba(255,255,255,0.92)" />
+      {/* Centre circle */}
+      <path d={projCircle(200, 100, 30)} fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth={1.5} />
+      {(() => { const c = cToS(200,100); return <circle cx={c.x} cy={c.y} r={2.5} fill="rgba(255,255,255,0.92)" />; })()}
 
-      {/* ── Left penalty D (6m radius from centre of goal) ── */}
-      {/* Goal centre at (CX1+3, my). D = semicircle r=60px, right half only */}
-      <path d={`M ${CX1+3},${my - 60} A 60,60 0 0,1 ${CX1+3},${my + 60}`}
-        fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth={1.6} />
-      {/* Penalty spot (6m) */}
-      <circle cx={CX1 + 63} cy={my} r={2.5} fill="rgba(255,255,255,0.92)" />
-      {/* 2nd penalty spot (10m) */}
-      <circle cx={CX1 + 103} cy={my} r={2} fill="rgba(255,255,255,0.5)" />
+      {/* Left penalty D (6m = 60 units, right half arc) */}
+      <path d={projArc(0, 100, 60, -Math.PI/2, Math.PI/2)}
+        fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth={1.5} />
+      {/* Right penalty D */}
+      <path d={projArc(400, 100, 60, Math.PI/2, 3*Math.PI/2)}
+        fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth={1.5} />
 
-      {/* ── Right penalty D ── */}
-      <path d={`M ${CX2-3},${my - 60} A 60,60 0 0,0 ${CX2-3},${my + 60}`}
-        fill="none" stroke="rgba(255,255,255,0.92)" strokeWidth={1.6} />
-      <circle cx={CX2 - 63} cy={my} r={2.5} fill="rgba(255,255,255,0.92)" />
-      <circle cx={CX2 - 103} cy={my} r={2} fill="rgba(255,255,255,0.5)" />
+      {/* Penalty spots */}
+      <circle cx={lspot.x} cy={lspot.y} r={2.2} fill="rgba(255,255,255,0.92)" />
+      <circle cx={rspot.x} cy={rspot.y} r={2.2} fill="rgba(255,255,255,0.92)" />
 
-      {/* ── Left goal (3m wide = 30px, with 3D depth) ── */}
-      <rect x={CX1 - 8} y={my - 15} width={8} height={30}
-        fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.88)" strokeWidth={1.4} />
-      {/* Goal net lines (suggest 3D grid) */}
-      {[-10, -5, 0, 5, 10].map(dy => (
-        <line key={dy}
-          x1={CX1 - 8} y1={my + dy} x2={CX1} y2={my + dy}
-          stroke="rgba(255,255,255,0.18)" strokeWidth={0.5} />
-      ))}
-      {[-8, -4].map(dx => (
-        <line key={dx}
-          x1={CX1 + dx} y1={my - 15} x2={CX1 + dx} y2={my + 15}
-          stroke="rgba(255,255,255,0.18)" strokeWidth={0.5} />
-      ))}
-      {/* Goal post 3D top/bottom edge */}
-      <line x1={CX1 - 8} y1={my - 15} x2={CX1} y2={my - 13}
-        stroke="rgba(255,255,255,0.5)" strokeWidth={0.8} />
-      <line x1={CX1 - 8} y1={my + 15} x2={CX1} y2={my + 13}
-        stroke="rgba(255,255,255,0.5)" strokeWidth={0.8} />
+      {/* ── Left goal (3D box) ── */}
+      {/* Back face */}
+      <polygon points={`${glT2.x},${glT2.y} ${glB2.x},${glB2.y} ${glB.x},${glB.y} ${glT.x},${glT.y}`}
+        fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.85)" strokeWidth={1.4} />
+      {/* Front post lines */}
+      <line x1={glT.x} y1={glT.y} x2={glT.x-8} y2={glT.y+2} stroke="rgba(255,255,255,0.9)" strokeWidth={1.4} />
+      <line x1={glB.x} y1={glB.y} x2={glB.x-8} y2={glB.y-2} stroke="rgba(255,255,255,0.9)" strokeWidth={1.4} />
+      {/* Net grid */}
+      {[-10,-5,0,5,10].map(dy => {
+        const a = cToS(0, 100+dy), b = cToS(gDepth, 100+dy);
+        return <line key={dy} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="rgba(255,255,255,0.15)" strokeWidth="0.5" />;
+      })}
+      {[0,0.5,1].map(dx => {
+        const a = cToS(dx*gDepth, 85), b = cToS(dx*gDepth, 115);
+        return <line key={dx} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="rgba(255,255,255,0.15)" strokeWidth="0.5" />;
+      })}
 
-      {/* ── Right goal ── */}
-      <rect x={CX2} y={my - 15} width={8} height={30}
-        fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.88)" strokeWidth={1.4} />
-      {[-10, -5, 0, 5, 10].map(dy => (
-        <line key={dy}
-          x1={CX2} y1={my + dy} x2={CX2 + 8} y2={my + dy}
-          stroke="rgba(255,255,255,0.18)" strokeWidth={0.5} />
-      ))}
-      {[4, 8].map(dx => (
-        <line key={dx}
-          x1={CX2 + dx} y1={my - 15} x2={CX2 + dx} y2={my + 15}
-          stroke="rgba(255,255,255,0.18)" strokeWidth={0.5} />
-      ))}
-      <line x1={CX2 + 8} y1={my - 15} x2={CX2} y2={my - 13}
-        stroke="rgba(255,255,255,0.5)" strokeWidth={0.8} />
-      <line x1={CX2 + 8} y1={my + 15} x2={CX2} y2={my + 13}
-        stroke="rgba(255,255,255,0.5)" strokeWidth={0.8} />
+      {/* ── Right goal (3D box) ── */}
+      <polygon points={`${grT2.x},${grT2.y} ${grB2.x},${grB2.y} ${grB.x},${grB.y} ${grT.x},${grT.y}`}
+        fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.85)" strokeWidth={1.4} />
+      <line x1={grT.x} y1={grT.y} x2={grT.x+8} y2={grT.y+2} stroke="rgba(255,255,255,0.9)" strokeWidth={1.4} />
+      <line x1={grB.x} y1={grB.y} x2={grB.x+8} y2={grB.y-2} stroke="rgba(255,255,255,0.9)" strokeWidth={1.4} />
+      {[-10,-5,0,5,10].map(dy => {
+        const a = cToS(400, 100+dy), b = cToS(400-gDepth, 100+dy);
+        return <line key={dy} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="rgba(255,255,255,0.15)" strokeWidth="0.5" />;
+      })}
+      {[0,0.5,1].map(dx => {
+        const a = cToS(400-dx*gDepth, 85), b = cToS(400-dx*gDepth, 115);
+        return <line key={dx} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="rgba(255,255,255,0.15)" strokeWidth="0.5" />;
+      })}
     </g>
   );
 }
 
-// ─── 3-D Player figure ────────────────────────────────────────────────────────
+// ─── 3-D front-facing player sprite ──────────────────────────────────────────
+type PalKey = keyof typeof PAL;
 
 interface FigureProps {
-  colorKey: keyof typeof PALETTE;
+  pk: PalKey;
   number: number;
   isGK: boolean;
   isRunning: boolean;
   isSelected: boolean;
-  rotationDeg: number;
+  flip: boolean;   // mirror left/right based on direction
 }
 
-function PlayerFigure({ colorKey, number, isGK, isRunning, isSelected, rotationDeg }: FigureProps) {
-  const anim = (name: string): React.CSSProperties =>
-    isRunning ? { transformOrigin: '0px 0px', animation: `${name} 0.44s ease-in-out infinite` } : {};
+function PlayerFigure({ pk, number, isGK, isRunning, isSelected, flip }: FigureProps) {
+  const p = PAL[pk];
+  const anim = (n: string): React.CSSProperties =>
+    isRunning ? { transformOrigin: '0px 0px', animation: `${n} 0.44s ease-in-out infinite` } : {};
 
-  const jH = `url(#cylH-${colorKey})`;   // jersey horizontal cylinder
-  const jV = `url(#cylV-${colorKey})`;   // jersey vertical
-  const sk = `url(#cylH-skin)`;
-  const skV = `url(#cylV-skin)`;
-  const bt = `url(#sph-boot)`;
-  const pal = PALETTE[colorKey];
+  const cH = `url(#cH-${pk})`;
+  const cV = `url(#cV-${pk})`;
+  const sk  = 'url(#cH-skin)';
+  const skV = 'url(#cV-skin)';
 
   return (
-    <g transform={`rotate(${rotationDeg})`} filter="url(#figShadow)">
-      <circle r={20} fill="transparent" />
+    <g transform={flip ? 'scale(-1,1)' : ''} filter="url(#fshadow)">
+      <circle r={18} fill="transparent" />
 
-      {isSelected && (
-        <circle r={21} fill="none" stroke="#FFD60A" strokeWidth={2.2}
-          filter="url(#glowYellow)" />
-      )}
+      {isSelected && <circle r={20} fill="none" stroke="#FFD60A" strokeWidth={2} filter="url(#fglow)" />}
 
-      {/* ── GK badge ── */}
-      {isGK && (
-        <g>
-          <rect x={-10} y={-33} width={20} height={8} rx={3} fill={pal.base} />
-          <text x={0} y={-27} textAnchor="middle" dominantBaseline="central"
-            fontSize={5.5} fontWeight="900" fill="white" style={{ pointerEvents: 'none' }}>GK</text>
-        </g>
-      )}
+      {/* GK badge */}
+      {isGK && <>
+        <rect x={-9} y={-32} width={18} height={8} rx={3} fill={p.j} />
+        <text x={0} y={-26} textAnchor="middle" dominantBaseline="central"
+          fontSize={5.5} fontWeight="900" fill="white" style={{ pointerEvents:'none' }}>GK</text>
+      </>}
 
-      {/* ── Ground shadow ellipse ── */}
-      <ellipse cx={1} cy={20} rx={11} ry={3} fill="rgba(0,0,0,0.35)" />
+      {/* Ground shadow */}
+      <ellipse cx={flip ? -1 : 1} cy={21} rx={10} ry={3} fill="rgba(0,0,0,0.30)" />
 
-      {/* ── Left arm (pivot: L shoulder −10, −5) ── */}
+      {/* ── LEFT arm (pivot L shoulder -10,-5) ── */}
       <g transform="translate(-10,-5)">
         <g style={anim('drillArmL')}>
-          <rect x={-9} y={-3} width={9} height={6} rx={3} fill={jH} />
-          {/* sleeve stripe */}
-          <rect x={-9} y={-1} width={9} height={2} rx={1} fill="rgba(255,255,255,0.18)" />
+          <rect x={-9} y={-3} width={9} height={6} rx={3} fill={cH} />
           <rect x={-17} y={-2.5} width={8} height={5} rx={2.5} fill={sk} />
         </g>
       </g>
 
-      {/* ── Right arm (pivot: R shoulder 10, −5) ── */}
+      {/* ── RIGHT arm (pivot R shoulder 10,-5) ── */}
       <g transform="translate(10,-5)">
         <g style={anim('drillArmR')}>
-          <rect x={0} y={-3} width={9} height={6} rx={3} fill={jH} />
-          <rect x={0} y={-1} width={9} height={2} rx={1} fill="rgba(255,255,255,0.18)" />
+          <rect x={0} y={-3} width={9} height={6} rx={3} fill={cH} />
           <rect x={9} y={-2.5} width={8} height={5} rx={2.5} fill={sk} />
         </g>
       </g>
 
       {/* ── Jersey torso ── */}
       {/* Collar */}
-      <ellipse cx={0} cy={-9.5} rx={4} ry={2.2} fill={jV} />
+      <ellipse cx={0} cy={-9} rx={3.5} ry={2} fill={cV} />
       {/* Body */}
-      <path d="M -10,-9 Q -11,-2 -9,7 L 9,7 Q 11,-2 10,-9 Z" fill={jV} />
-      {/* Horizontal jersey stripe */}
-      <path d="M -10,-2 Q -11,0 -9,2 L 9,2 Q 11,0 10,-2 Z"
-        fill="rgba(255,255,255,0.13)" />
+      <path d="M -10,-8 Q -11,-1 -9,7 L 9,7 Q 11,-1 10,-8 Z" fill={cV} />
+      {/* Jersey stripes */}
+      <path d="M -10,-5 Q -11,-3 -9,-1 L 9,-1 Q 11,-3 10,-5 Z" fill={p.stripe} opacity={0.18} />
+      <path d="M -10,-1 Q -11,1 -9,3 L 9,3 Q 11,1 10,-1 Z" fill={p.stripe} opacity={0.10} />
       {/* Number */}
       <text x={0} y={0} textAnchor="middle" dominantBaseline="central"
-        fontSize={6.5} fontWeight="900" fill="white"
-        style={{ pointerEvents: 'none' }}>
+        fontSize={6} fontWeight="900" fill="white" style={{ pointerEvents:'none' }}>
         {number}
       </text>
 
       {/* ── Shorts ── */}
-      <rect x={-9} y={6} width={18} height={7} rx={2.5}
-        fill={pal.lo} opacity={0.9} />
-      {/* Shorts center seam */}
-      <line x1={0} y1={6} x2={0} y2={13} stroke="rgba(0,0,0,0.3)" strokeWidth={0.7} />
+      <rect x={-9} y={6} width={18} height={7} rx={2} fill={p.sh} />
+      <line x1={0} y1={6} x2={0} y2={13} stroke="rgba(0,0,0,0.25)" strokeWidth={0.8} />
 
-      {/* ── Left leg (pivot: L hip −4, 12) ── */}
+      {/* ── LEFT leg (pivot L hip -4, 12) ── */}
       <g transform="translate(-4,12)">
         <g style={anim('drillLegL')}>
-          <rect x={-4} y={0} width={8} height={8} rx={4} fill={sk} />
-          <rect x={-3.5} y={7} width={7} height={8} rx={3.5} fill={skV} opacity={0.85} />
-          {/* Sock white top */}
-          <rect x={-3.5} y={13} width={7} height={2} rx={1} fill="rgba(255,255,255,0.6)" />
+          <rect x={-4} y={0} width={8} height={8}  rx={4}   fill={sk} />
+          <rect x={-3.5} y={7} width={7} height={9} rx={3.5} fill={skV} opacity={0.85} />
+          {/* Sock white */}
+          <rect x={-3.5} y={14} width={7} height={2} rx={1} fill="rgba(255,255,255,0.7)" />
           {/* Boot */}
-          <ellipse cx={0} cy={17} rx={5} ry={2.5} fill={bt} />
-          <ellipse cx={1} cy={16.2} rx={2.2} ry={1} fill="rgba(255,255,255,0.2)" />
+          <ellipse cx={0} cy={18} rx={5} ry={2.5} fill="url(#sph-boot)" />
+          <ellipse cx={1.5} cy={17} rx={2} ry={1}   fill="rgba(255,255,255,0.2)" />
         </g>
       </g>
 
-      {/* ── Right leg (pivot: R hip 4, 12) ── */}
+      {/* ── RIGHT leg (pivot R hip 4, 12) ── */}
       <g transform="translate(4,12)">
         <g style={anim('drillLegR')}>
-          <rect x={-4} y={0} width={8} height={8} rx={4} fill={sk} />
-          <rect x={-3.5} y={7} width={7} height={8} rx={3.5} fill={skV} opacity={0.85} />
-          <rect x={-3.5} y={13} width={7} height={2} rx={1} fill="rgba(255,255,255,0.6)" />
-          <ellipse cx={0} cy={17} rx={5} ry={2.5} fill={bt} />
-          <ellipse cx={1} cy={16.2} rx={2.2} ry={1} fill="rgba(255,255,255,0.2)" />
+          <rect x={-4} y={0} width={8} height={8}  rx={4}   fill={sk} />
+          <rect x={-3.5} y={7} width={7} height={9} rx={3.5} fill={skV} opacity={0.85} />
+          <rect x={-3.5} y={14} width={7} height={2} rx={1} fill="rgba(255,255,255,0.7)" />
+          <ellipse cx={0} cy={18} rx={5} ry={2.5} fill="url(#sph-boot)" />
+          <ellipse cx={1.5} cy={17} rx={2} ry={1}   fill="rgba(255,255,255,0.2)" />
         </g>
       </g>
 
@@ -358,95 +393,77 @@ function PlayerFigure({ colorKey, number, isGK, isRunning, isSelected, rotationD
       <rect x={-3} y={-14} width={6} height={6} rx={3} fill={skV} />
 
       {/* ── Head sphere ── */}
-      <circle cy={-22} r={9} fill={`url(#sph-skin)`} />
+      <circle cy={-21} r={9}   fill="url(#sph-skin)" />
       {/* Hair cap */}
-      <circle cy={-22} r={9} fill={`url(#sph-${colorKey})`}
-        clipPath={`url(#hairClip-${colorKey})`} />
+      <circle cy={-21} r={9}   fill={`url(#sph-${pk})`} clipPath={`url(#hc-${pk})`} />
       {/* Ears */}
-      <ellipse cx={-9} cy={-22} rx={2}   ry={3}   fill={`url(#sph-skin)`} />
-      <ellipse cx={ 9} cy={-22} rx={2}   ry={3}   fill={`url(#sph-skin)`} />
+      <ellipse cx={-9.2} cy={-21} rx={2}   ry={3}   fill="url(#sph-skin)" />
+      <ellipse cx={ 9.2} cy={-21} rx={2}   ry={3}   fill="url(#sph-skin)" />
       {/* Eyebrows */}
-      <path d="M -4.5,-24.5 Q -2.5,-26 -0.5,-24.5" fill="none" stroke={pal.base} strokeWidth={1.2} strokeLinecap="round" />
-      <path d="M 0.5,-24.5 Q 2.5,-26 4.5,-24.5"   fill="none" stroke={pal.base} strokeWidth={1.2} strokeLinecap="round" />
+      <path d="M -4.5,-24 Q -2.5,-25.8 -0.5,-24" fill="none" stroke={p.jlo} strokeWidth={1.3} strokeLinecap="round" />
+      <path d="M 0.5,-24 Q 2.5,-25.8 4.5,-24"   fill="none" stroke={p.jlo} strokeWidth={1.3} strokeLinecap="round" />
       {/* Eyes */}
-      <ellipse cx={-3} cy={-22.5} rx={2.2} ry={1.8} fill="white" />
-      <ellipse cx={ 3} cy={-22.5} rx={2.2} ry={1.8} fill="white" />
-      <circle  cx={-2.6} cy={-22.2} r={1.3} fill="#2a1a08" />
-      <circle  cx={ 3.4} cy={-22.2} r={1.3} fill="#2a1a08" />
-      <circle  cx={-2.1} cy={-22.7} r={0.5} fill="white" opacity={0.9} />
-      <circle  cx={ 3.9} cy={-22.7} r={0.5} fill="white" opacity={0.9} />
+      <ellipse cx={-3}  cy={-21.5} rx={2.3} ry={1.8} fill="white" />
+      <ellipse cx={ 3}  cy={-21.5} rx={2.3} ry={1.8} fill="white" />
+      <circle  cx={-2.6} cy={-21.2} r={1.3} fill="#2a1a08" />
+      <circle  cx={ 3.4} cy={-21.2} r={1.3} fill="#2a1a08" />
+      <circle  cx={-2}   cy={-21.7} r={0.5} fill="white" opacity={0.9} />
+      <circle  cx={ 4}   cy={-21.7} r={0.5} fill="white" opacity={0.9} />
       {/* Mouth */}
-      <path d="M -2,-20 Q 0,-18.5 2,-20" fill="none" stroke="rgba(160,80,30,0.7)" strokeWidth={0.8} strokeLinecap="round" />
-      {/* Head specular */}
-      <circle cx={-4} cy={-27} r={2.5} fill="white" opacity={0.22} />
-    </g>
-  );
-}
-
-// ─── Movement arrow ───────────────────────────────────────────────────────────
-
-function MovementArrow({ from, to, color }: { from: EntityPos; to: EntityPos; color: string }) {
-  const dx = to.x - from.x;
-  const dy = to.y - from.y;
-  const len = Math.sqrt(dx * dx + dy * dy);
-  if (len < 6) return null;
-  const ux = dx / len, uy = dy / len;
-  const ex = to.x - ux * 13;
-  const ey = to.y - uy * 13;
-  const s = 6;
-  return (
-    <g opacity={0.85}>
-      {/* Shadow line */}
-      <line x1={from.x + 0.5} y1={from.y + 1} x2={ex + 0.5} y2={ey + 1}
-        stroke="rgba(0,0,0,0.3)" strokeWidth={2.5} strokeDasharray="5 3" />
-      {/* Coloured line */}
-      <line x1={from.x} y1={from.y} x2={ex} y2={ey}
-        stroke={color} strokeWidth={2} strokeDasharray="5 3"
-        style={{ filter: `drop-shadow(0 0 2px ${color})` }} />
-      <polygon
-        points={`${to.x},${to.y} ${ex - s * ux + s * 0.5 * uy},${ey - s * uy - s * 0.5 * ux} ${ex - s * ux - s * 0.5 * uy},${ey - s * uy + s * 0.5 * ux}`}
-        fill={color}
-        style={{ filter: `drop-shadow(0 0 2px ${color})` }}
-      />
+      <path d="M -2,-19 Q 0,-17.5 2,-19" fill="none" stroke="rgba(150,70,20,0.7)" strokeWidth={0.8} strokeLinecap="round" />
+      {/* Specular */}
+      <circle cx={-4} cy={-26} r={2.5} fill="white" opacity={0.22} />
     </g>
   );
 }
 
 // ─── 3-D Soccer ball ─────────────────────────────────────────────────────────
-
-function SoccerBall({ pos, isSelected, onDown }: {
-  pos: EntityPos;
+function SoccerBall({ sx, sy, isSelected, onDown }: {
+  sx: number; sy: number;
   isSelected: boolean;
   onDown: (e: React.MouseEvent | React.TouchEvent) => void;
 }) {
   return (
-    <g transform={`translate(${pos.x},${pos.y})`}
+    <g transform={`translate(${sx},${sy})`}
       onMouseDown={onDown} onTouchStart={onDown}
-      style={{ cursor: 'grab' }}>
-      {/* Ground shadow */}
-      <ellipse cx={1} cy={9} rx={7} ry={2.5} fill="rgba(0,0,0,0.35)" />
-      {/* Ball */}
-      <circle r={8} fill="url(#sph-boot)" />
-      <circle r={8} fill="rgba(240,240,230,0.92)" />
-      {/* Patches */}
-      <circle r={8} fill="none" stroke="rgba(0,0,0,0.08)" strokeWidth={7}
-        strokeDasharray="4 28" />
+      style={{ cursor: 'grab' }} filter="url(#fshadow)">
+      <ellipse cx={1} cy={9} rx={7} ry={2.5} fill="rgba(0,0,0,0.32)" />
+      <circle r={8} fill="url(#sph-ball)" />
       <polygon points="0,-6 5,-2 3,4 -3,4 -5,-2"
-        fill="#111" opacity={0.18} />
+        fill="#111" opacity={0.16} />
       <polygon points="0,-6 5,-2 3,4 -3,4 -5,-2"
-        fill="none" stroke="#333" strokeWidth={0.7} />
-      {/* Sphere shading */}
-      <circle r={8} fill="url(#sph-skin)" opacity={0.2} />
-      {/* Specular */}
-      <circle cx={-3} cy={-4} r={2.2} fill="white" opacity={0.65} />
-      {/* Selection */}
-      {isSelected && <circle r={10} fill="none" stroke="#FFD60A" strokeWidth={2} filter="url(#glowYellow)" />}
+        fill="none" stroke="#555" strokeWidth={0.7} />
+      <circle cx={-3} cy={-4} r={2.5} fill="white" opacity={0.6} />
+      {isSelected && <circle r={10} fill="none" stroke="#FFD60A" strokeWidth={2} filter="url(#fglow)" />}
+    </g>
+  );
+}
+
+// ─── Movement arrow (in perspective coords) ───────────────────────────────────
+function MovementArrow({ from, to, color }: { from: EntityPos; to: EntityPos; color: string }) {
+  const a = cToS(from.x, from.y);
+  const b = cToS(to.x, to.y);
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.sqrt(dx*dx + dy*dy);
+  if (len < 5) return null;
+  const ux = dx/len, uy = dy/len;
+  const ex = b.x - ux*12, ey = b.y - uy*12;
+  const s = 6;
+  return (
+    <g opacity={0.88}>
+      <line x1={a.x+0.5} y1={a.y+1} x2={ex+0.5} y2={ey+1}
+        stroke="rgba(0,0,0,0.28)" strokeWidth={2.5} strokeDasharray="5 3" />
+      <line x1={a.x} y1={a.y} x2={ex} y2={ey}
+        stroke={color} strokeWidth={2.2} strokeDasharray="5 3"
+        style={{ filter:`drop-shadow(0 0 2px ${color})` }} />
+      <polygon
+        points={`${b.x},${b.y} ${ex - s*ux + s*0.5*uy},${ey - s*uy - s*0.5*ux} ${ex - s*ux - s*0.5*uy},${ey - s*uy + s*0.5*ux}`}
+        fill={color} style={{ filter:`drop-shadow(0 0 2px ${color})` }} />
     </g>
   );
 }
 
 // ─── Main canvas ──────────────────────────────────────────────────────────────
-
 export default function DrillCanvas() {
   const svgRef = useRef<SVGSVGElement>(null);
   const store = useDrillStore();
@@ -481,10 +498,10 @@ export default function DrillCanvas() {
       const pt = svgRef.current.createSVGPoint();
       pt.x = 'touches' in e ? (e as TouchEvent).touches[0].clientX : (e as MouseEvent).clientX;
       pt.y = 'touches' in e ? (e as TouchEvent).touches[0].clientY : (e as MouseEvent).clientY;
-      const p = pt.matrixTransform(svgRef.current.getScreenCTM()!.inverse());
-      store.moveEntity(dragging.current,
-        Math.max(CX1 + 6, Math.min(CX2 - 6, p.x)),
-        Math.max(CY1 + 10, Math.min(CY2 - 10, p.y)));
+      const svgP = pt.matrixTransform(svgRef.current.getScreenCTM()!.inverse());
+      // Convert SVG screen point → court coordinates via perspective inverse
+      const court = sToC(svgP.x, svgP.y);
+      store.moveEntity(dragging.current, court.x, court.y);
     };
     const up = () => { dragging.current = null; };
     window.addEventListener('mousemove', mv);
@@ -499,71 +516,89 @@ export default function DrillCanvas() {
     };
   }, [store]);
 
+  // Sort players by y so closer (larger y) players render on top
+  const sortedPlayers = [...players].sort((a, b) => {
+    const pa = currentPositions[a.id]?.y ?? 0;
+    const pb = currentPositions[b.id]?.y ?? 0;
+    return pa - pb;
+  });
+
   return (
     <svg
       ref={svgRef}
       viewBox={`0 0 ${VW} ${VH}`}
-      style={{ width: '100%', borderRadius: 10, touchAction: 'none', display: 'block', userSelect: 'none' }}
+      style={{ width:'100%', borderRadius:10, touchAction:'none', display:'block', userSelect:'none' }}
       onClick={() => store.setSelectedEntity(null)}
     >
       <SVGDefs />
-      <FutsalCourt />
+      <IsoCourt />
 
-      {/* Movement arrows */}
+      {/* Movement arrows in perspective */}
       {nextStepPos && players.map(p => {
         const from = currentPositions[p.id], to = nextStepPos[p.id];
         if (!from || !to) return null;
-        return <MovementArrow key={p.id} from={from} to={to} color={p.team === 'home' ? '#93c5fd' : '#fca5a5'} />;
+        return <MovementArrow key={p.id} from={from} to={to} color={p.team==='home'?'#93c5fd':'#fca5a5'} />;
       })}
       {nextStepPos && currentPositions[BALL_ID_CONST] && nextStepPos[BALL_ID_CONST] && (
         <MovementArrow from={currentPositions[BALL_ID_CONST]} to={nextStepPos[BALL_ID_CONST]} color="#FFD60A" />
       )}
 
-      {/* Players */}
-      {players.map(p => {
+      {/* Players — sorted far-to-near so near players render on top */}
+      {sortedPlayers.map(p => {
         const pos = currentPositions[p.id];
         if (!pos) return null;
-        const colorKey = (p.team + (p.isGK ? '_gk' : '')) as keyof typeof PALETTE;
+        const pk = (p.team + (p.isGK ? '_gk' : '')) as PalKey;
+        const { x: sx, y: sy } = cToS(pos.x, pos.y);
 
-        const rotDeg = (() => {
+        // Perspective scale: near=1.0, far=0.72
+        const pScale = 0.72 + 0.28 * (pos.y / 200);
+
+        // Flip based on x-movement direction
+        const flip = (() => {
           if (isPlaying && playNextPos) {
-            const a = facingAngle(playCurPos[p.id], playNextPos[p.id]);
-            if (a !== null) return a;
+            const dx = (playNextPos[p.id]?.x ?? pos.x) - (playCurPos[p.id]?.x ?? pos.x);
+            if (Math.abs(dx) > 5) return dx < 0;
           }
           if (!isPlaying && nextStepPos) {
-            const a = facingAngle(currentPositions[p.id], nextStepPos[p.id]);
-            if (a !== null) return a;
+            const dx = (nextStepPos[p.id]?.x ?? pos.x) - pos.x;
+            if (Math.abs(dx) > 5) return dx < 0;
           }
-          return 0;
+          return p.team !== 'home';
         })();
 
         const isRunning = isPlaying && (() => {
-          const fr = playCurPos[p.id], to = playNextPos?.[p.id];
-          if (!fr || !to) return false;
-          const dx = to.x - fr.x, dy = to.y - fr.y;
-          return dx * dx + dy * dy > 16;
+          const fr = playCurPos[p.id], to2 = playNextPos?.[p.id];
+          if (!fr || !to2) return false;
+          const dx = to2.x - fr.x, dy = to2.y - fr.y;
+          return dx*dx + dy*dy > 16;
         })();
 
         return (
           <g key={p.id}
-            transform={`translate(${pos.x},${pos.y})`}
+            transform={`translate(${sx},${sy}) scale(${pScale})`}
             onMouseDown={e => onDown(e, p.id)}
             onTouchStart={e => onDown(e, p.id)}
             style={{ cursor: isPlaying ? 'default' : 'grab' }}>
             <PlayerFigure
-              colorKey={colorKey} number={p.number} isGK={p.isGK}
-              isRunning={isRunning} isSelected={selectedEntity === p.id} rotationDeg={rotDeg}
+              pk={pk} number={p.number} isGK={p.isGK}
+              isRunning={isRunning} isSelected={selectedEntity === p.id} flip={flip}
             />
           </g>
         );
       })}
 
+      {/* Ball */}
       {(() => {
         const pos = currentPositions[BALL_ID_CONST];
         if (!pos) return null;
+        const { x: sx, y: sy } = cToS(pos.x, pos.y);
+        const pScale = 0.72 + 0.28 * (pos.y / 200);
         return (
-          <SoccerBall pos={pos} isSelected={selectedEntity === BALL_ID_CONST}
-            onDown={e => onDown(e, BALL_ID_CONST)} />
+          <g transform={`scale(${pScale})`} style={{ transformOrigin: `${sx}px ${sy}px` }}>
+            <SoccerBall sx={sx} sy={sy}
+              isSelected={selectedEntity === BALL_ID_CONST}
+              onDown={e => onDown(e, BALL_ID_CONST)} />
+          </g>
         );
       })()}
     </svg>
