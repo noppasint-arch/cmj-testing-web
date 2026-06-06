@@ -5,6 +5,7 @@ import { usePathname } from 'next/navigation';
 const tabs = [
   { href: '/', label: 'Athletes', icon: '👤' },
   { href: '/history', label: 'History', icon: '📊' },
+  { href: '/drill', label: 'Drill', icon: '⚽' },
 ];
 
 export default function NavBar() {
