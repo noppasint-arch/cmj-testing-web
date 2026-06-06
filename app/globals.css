@@ -49,3 +49,21 @@ input[type=range]::-webkit-slider-thumb {
   background: var(--primary);
   cursor: pointer;
 }
+
+/* Drill animator — stick figure running animation */
+@keyframes drillLegL {
+  0%, 100% { transform: rotate(-28deg); }
+  50%       { transform: rotate(28deg); }
+}
+@keyframes drillLegR {
+  0%, 100% { transform: rotate(28deg); }
+  50%       { transform: rotate(-28deg); }
+}
+@keyframes drillArmL {
+  0%, 100% { transform: rotate(22deg); }
+  50%       { transform: rotate(-22deg); }
+}
+@keyframes drillArmR {
+  0%, 100% { transform: rotate(-22deg); }
+  50%       { transform: rotate(22deg); }
+}
